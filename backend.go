@@ -2,6 +2,7 @@ package gofakes3
 
 import (
 	"io"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws/awserr"
 )
@@ -306,6 +307,15 @@ type VersionedBackend interface {
 	// The Backend MUST treat a nil prefix identically to a zero prefix, and a
 	// nil page identically to a zero page.
 	ListBucketVersions(bucketName string, prefix *Prefix, page *ListBucketVersionsPage) (*ListBucketVersionsResult, error)
+}
+
+type MultipartBackend interface {
+	InitiateMultipartUpload(bucket, object string, meta map[string]string, initiated time.Time) UploadID
+	ListMultipartUploadParts(bucket, object string, uploadID UploadID, marker int, limit int64) (*ListMultipartUploadPartsResult, error)
+	ListMultipartUploads(bucket string, marker *UploadListMarker, prefix Prefix, limit int64) (*ListMultipartUploadsResult, error)
+	PutMultipartUploadPart(bucket string, object string, id UploadID, partNumber int, at time.Time, input io.Reader, size int64) (string, error)
+	CompleteMultipartUpload(bucket string, object string, id UploadID, cmup *CompleteMultipartUploadRequest) (*CompleteMultipartUploadData, error)
+	AbortMultipartUpload(bucket string, object string, id UploadID) error
 }
 
 func MergeMetadata(db Backend, bucketName string, objectName string, meta map[string]string) error {

@@ -1,7 +1,6 @@
 package gofakes3
 
 import (
-	"bytes"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
@@ -35,7 +34,7 @@ type GoFakeS3 struct {
 	failOnUnimplementedPage bool
 	hostBucket              bool
 	autoBucket              bool
-	uploader                *uploader
+	uploader                MultipartBackend
 	log                     Logger
 }
 
@@ -43,12 +42,18 @@ type GoFakeS3 struct {
 // Several Backend implementations ship with GoFakeS3, which can be found in the
 // gofakes3/backends package.
 func New(backend Backend, options ...Option) *GoFakeS3 {
+
+	mpu, ok := backend.(MultipartBackend)
+	if !ok {
+		mpu = newUploader()
+	}
+
 	s3 := &GoFakeS3{
 		storage:           backend,
 		timeSkew:          DefaultSkewLimit,
 		metadataSizeLimit: DefaultMetadataSizeLimit,
 		integrityCheck:    true,
-		uploader:          newUploader(),
+		uploader:          mpu,
 		requestID:         0,
 	}
 
@@ -801,9 +806,9 @@ func (g *GoFakeS3) initiateMultipartUpload(bucket, object string, w http.Respons
 		return err
 	}
 
-	upload := g.uploader.Begin(bucket, object, meta, g.timeSource.Now())
+	uploadID := g.uploader.InitiateMultipartUpload(bucket, object, meta, g.timeSource.Now())
 	out := InitiateMultipartUpload{
-		UploadID: upload.ID,
+		UploadID: uploadID,
 		Bucket:   bucket,
 		Key:      object,
 	}
@@ -830,15 +835,6 @@ func (g *GoFakeS3) putMultipartUploadPart(bucket, object string, uploadID Upload
 		return ErrMissingContentLength
 	}
 
-	upload, err := g.uploader.Get(bucket, object, uploadID)
-	if err != nil {
-		// FIXME: What happens with S3 when you abort a multipart upload while
-		// part uploads are still in progress? In this case, we will retain the
-		// reference to the part even though another request goroutine may
-		// delete it; it will be available for GC when this function finishes.
-		return err
-	}
-
 	defer r.Body.Close()
 	var rdr io.Reader = r.Body
 
@@ -857,16 +853,7 @@ func (g *GoFakeS3) putMultipartUploadPart(bucket, object string, uploadID Upload
 		}
 	}
 
-	body, err := ReadAll(rdr, size)
-	if err != nil {
-		return err
-	}
-
-	if int64(len(body)) != r.ContentLength {
-		return ErrIncompleteBody
-	}
-
-	etag, err := upload.AddPart(int(partNumber), g.timeSource.Now(), body)
+	etag, err := g.uploader.PutMultipartUploadPart(bucket, object, uploadID, int(partNumber), g.timeSource.Now(), rdr, size)
 	if err != nil {
 		return err
 	}
@@ -877,7 +864,7 @@ func (g *GoFakeS3) putMultipartUploadPart(bucket, object string, uploadID Upload
 
 func (g *GoFakeS3) abortMultipartUpload(bucket, object string, uploadID UploadID, w http.ResponseWriter, r *http.Request) error {
 	g.log.Print(LogInfo, "abort multipart upload", bucket, object, uploadID)
-	if _, err := g.uploader.Complete(bucket, object, uploadID); err != nil {
+	if err := g.uploader.AbortMultipartUpload(bucket, object, uploadID); err != nil {
 		return err
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -892,17 +879,12 @@ func (g *GoFakeS3) completeMultipartUpload(bucket, object string, uploadID Uploa
 		return err
 	}
 
-	upload, err := g.uploader.Complete(bucket, object, uploadID)
+	cmpu, err := g.uploader.CompleteMultipartUpload(bucket, object, uploadID, &in)
 	if err != nil {
 		return err
 	}
 
-	fileBody, etag, err := upload.Reassemble(&in)
-	if err != nil {
-		return err
-	}
-
-	result, err := g.storage.PutObject(bucket, object, upload.Meta, bytes.NewReader(fileBody), int64(len(fileBody)))
+	result, err := g.storage.PutObject(bucket, object, cmpu.meta, cmpu.fileBody, cmpu.size)
 	if err != nil {
 		return err
 	}
@@ -911,7 +893,7 @@ func (g *GoFakeS3) completeMultipartUpload(bucket, object string, uploadID Uploa
 	}
 
 	return g.xmlEncoder(w).Encode(&CompleteMultipartUploadResult{
-		ETag:   etag,
+		ETag:   cmpu.etag,
 		Bucket: bucket,
 		Key:    object,
 	})
@@ -934,7 +916,7 @@ func (g *GoFakeS3) listMultipartUploads(bucket string, w http.ResponseWriter, r 
 		maxUploads = DefaultMaxUploads
 	}
 
-	out, err := g.uploader.List(bucket, marker, prefix, maxUploads)
+	out, err := g.uploader.ListMultipartUploads(bucket, marker, prefix, maxUploads)
 	if err != nil {
 		return err
 	}
@@ -959,7 +941,7 @@ func (g *GoFakeS3) listMultipartUploadParts(bucket, object string, uploadID Uplo
 		return ErrInvalidURI
 	}
 
-	out, err := g.uploader.ListParts(bucket, object, uploadID, int(marker), maxParts)
+	out, err := g.uploader.ListMultipartUploadParts(bucket, object, uploadID, int(marker), maxParts)
 	if err != nil {
 		return err
 	}

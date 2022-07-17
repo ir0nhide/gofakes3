@@ -1,9 +1,12 @@
 package gofakes3
 
 import (
+	"bytes"
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"math/big"
 	"net/url"
 	"strings"
@@ -163,7 +166,7 @@ func newUploader() *uploader {
 	}
 }
 
-func (u *uploader) Begin(bucket, object string, meta map[string]string, initiated time.Time) *multipartUpload {
+func (u *uploader) InitiateMultipartUpload(bucket, object string, meta map[string]string, initiated time.Time) UploadID {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
@@ -185,11 +188,10 @@ func (u *uploader) Begin(bucket, object string, meta map[string]string, initiate
 	}
 
 	bucketUploads.add(mpu)
-
-	return mpu
+	return UploadID(u.uploadID.String())
 }
 
-func (u *uploader) ListParts(bucket, object string, uploadID UploadID, marker int, limit int64) (*ListMultipartUploadPartsResult, error) {
+func (u *uploader) ListMultipartUploadParts(bucket, object string, uploadID UploadID, marker int, limit int64) (*ListMultipartUploadPartsResult, error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
@@ -232,7 +234,7 @@ func (u *uploader) ListParts(bucket, object string, uploadID UploadID, marker in
 	return &result, nil
 }
 
-func (u *uploader) List(bucket string, marker *UploadListMarker, prefix Prefix, limit int64) (*ListMultipartUploadsResult, error) {
+func (u *uploader) ListMultipartUploads(bucket string, marker *UploadListMarker, prefix Prefix, limit int64) (*ListMultipartUploadsResult, error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
@@ -345,7 +347,7 @@ done:
 	return &result, nil
 }
 
-func (u *uploader) Complete(bucket, object string, id UploadID) (*multipartUpload, error) {
+func (u *uploader) CompleteMultipartUpload(bucket string, object string, id UploadID, cmup *CompleteMultipartUploadRequest) (*CompleteMultipartUploadData, error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	up, err := u.getUnlocked(bucket, object, id)
@@ -355,14 +357,30 @@ func (u *uploader) Complete(bucket, object string, id UploadID) (*multipartUploa
 
 	// if getUnlocked succeeded, so will this:
 	u.buckets[bucket].remove(id)
-
-	return up, nil
+	return up.reassemble(cmup)
 }
 
-func (u *uploader) Get(bucket, object string, id UploadID) (mu *multipartUpload, err error) {
+func (u *uploader) AbortMultipartUpload(bucket string, object string, id UploadID) error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	return u.getUnlocked(bucket, object, id)
+	_, err := u.getUnlocked(bucket, object, id)
+	if err != nil {
+		return err
+	}
+
+	// if getUnlocked succeeded, so will this:
+	u.buckets[bucket].remove(id)
+	return nil
+}
+
+func (u *uploader) PutMultipartUploadPart(bucket string, object string, id UploadID, partNumber int, at time.Time, input io.Reader, size int64) (etag string, err error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	up, err := u.getUnlocked(bucket, object, id)
+	if err != nil {
+		return "", err
+	}
+	return up.addPart(partNumber, at, input, size)
 }
 
 func (u *uploader) getUnlocked(bucket, object string, id UploadID) (mu *multipartUpload, err error) {
@@ -448,13 +466,21 @@ type multipartUpload struct {
 	mu sync.Mutex
 }
 
-func (mpu *multipartUpload) AddPart(partNumber int, at time.Time, body []byte) (etag string, err error) {
+func (mpu *multipartUpload) addPart(partNumber int, at time.Time, input io.Reader, size int64) (etag string, err error) {
 	if partNumber > MaxUploadPartNumber {
 		return "", ErrInvalidPart
 	}
 
 	mpu.mu.Lock()
 	defer mpu.mu.Unlock()
+	body, err := ioutil.ReadAll(input)
+
+	if err != nil {
+		return "", err
+	}
+	if size != int64(len(body)) {
+		return "", ErrorMessagef(ErrInvalidPart, "size mismatch, expected %d bytes, got %d bytes", size, len(body))
+	}
 
 	// What the ETag actually is is not specified, so let's just invent any old thing
 	// from guaranteed unique input:
@@ -475,44 +501,51 @@ func (mpu *multipartUpload) AddPart(partNumber int, at time.Time, body []byte) (
 	return etag, nil
 }
 
-func (mpu *multipartUpload) Reassemble(input *CompleteMultipartUploadRequest) (body []byte, etag string, err error) {
+func (mpu *multipartUpload) reassemble(input *CompleteMultipartUploadRequest) (*CompleteMultipartUploadData, error) {
 	mpu.mu.Lock()
 	defer mpu.mu.Unlock()
-
+	var cmpu CompleteMultipartUploadData
 	mpuPartsLen := len(mpu.parts)
 
 	// FIXME: what does AWS do when mpu.Parts > input.Parts? Presumably you may
 	// end up uploading more parts than you need to assemble, so it should
 	// probably just ignore that?
 	if len(input.Parts) > mpuPartsLen {
-		return nil, "", ErrInvalidPart
+		return nil, ErrInvalidPart
 	}
 
 	if !input.partsAreSorted() {
-		return nil, "", ErrInvalidPartOrder
+		return nil, ErrInvalidPartOrder
 	}
-
-	var size int64
 
 	for _, inPart := range input.Parts {
 		if inPart.PartNumber >= mpuPartsLen || mpu.parts[inPart.PartNumber] == nil {
-			return nil, "", ErrorMessagef(ErrInvalidPart, "unexpected part number %d in complete request", inPart.PartNumber)
+			return nil, ErrorMessagef(ErrInvalidPart, "unexpected part number %d in complete request", inPart.PartNumber)
 		}
 
 		upPart := mpu.parts[inPart.PartNumber]
 		if strings.Trim(inPart.ETag, "\"") != strings.Trim(upPart.ETag, "\"") {
-			return nil, "", ErrorMessagef(ErrInvalidPart, "unexpected part etag for number %d in complete request", inPart.PartNumber)
+			return nil, ErrorMessagef(ErrInvalidPart, "unexpected part etag for number %d in complete request", inPart.PartNumber)
 		}
 
-		size += int64(len(upPart.Body))
+		cmpu.size += int64(len(upPart.Body))
 	}
 
-	body = make([]byte, 0, size)
+	body := make([]byte, 0, cmpu.size)
 	for _, part := range input.Parts {
 		body = append(body, mpu.parts[part.PartNumber].Body...)
 	}
 
-	hash := fmt.Sprintf("%x", md5.Sum(body))
+	cmpu.etag = fmt.Sprintf("%x", md5.Sum(body))
 
-	return body, hash, nil
+	cmpu.fileBody = bytes.NewReader(body)
+
+	return &cmpu, nil
+}
+
+type CompleteMultipartUploadData struct {
+	fileBody io.Reader
+	size     int64
+	etag     string
+	meta     map[string]string
 }
