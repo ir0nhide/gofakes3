@@ -501,10 +501,10 @@ func (mpu *multipartUpload) addPart(partNumber int, at time.Time, input io.Reade
 	return etag, nil
 }
 
-func (mpu *multipartUpload) reassemble(input *CompleteMultipartUploadRequest) (*CompleteMultipartUploadData, error) {
+func (mpu *multipartUpload) reassemble(input *CompleteMultipartUploadRequest) (cmpud *CompleteMultipartUploadData, err error) {
 	mpu.mu.Lock()
 	defer mpu.mu.Unlock()
-	var cmpu CompleteMultipartUploadData
+	cmpud = &CompleteMultipartUploadData{}
 	mpuPartsLen := len(mpu.parts)
 
 	// FIXME: what does AWS do when mpu.Parts > input.Parts? Presumably you may
@@ -514,7 +514,7 @@ func (mpu *multipartUpload) reassemble(input *CompleteMultipartUploadRequest) (*
 		return nil, ErrInvalidPart
 	}
 
-	if !input.partsAreSorted() {
+	if !input.PartsAreSorted() {
 		return nil, ErrInvalidPartOrder
 	}
 
@@ -528,24 +528,31 @@ func (mpu *multipartUpload) reassemble(input *CompleteMultipartUploadRequest) (*
 			return nil, ErrorMessagef(ErrInvalidPart, "unexpected part etag for number %d in complete request", inPart.PartNumber)
 		}
 
-		cmpu.size += int64(len(upPart.Body))
+		cmpud.Size += int64(len(upPart.Body))
 	}
 
-	body := make([]byte, 0, cmpu.size)
+	body := make([]byte, 0, cmpud.Size)
 	for _, part := range input.Parts {
 		body = append(body, mpu.parts[part.PartNumber].Body...)
 	}
 
-	cmpu.etag = fmt.Sprintf("%x", md5.Sum(body))
+	cmpud.Etag = fmt.Sprintf("%x", md5.Sum(body))
 
-	cmpu.fileBody = bytes.NewReader(body)
+	bodyReader := bytes.NewReader(body)
+	cmpud.FileBody = io.NopCloser(bodyReader)
+	cmpud.Meta = mpu.Meta
 
-	return &cmpu, nil
+	return cmpud, nil
 }
 
 type CompleteMultipartUploadData struct {
-	fileBody io.Reader
-	size     int64
-	etag     string
-	meta     map[string]string
+	FileBody io.ReadCloser
+	Size     int64
+	Etag     string
+	Meta     map[string]string
+	Cleaner  MultipartUploadCleaner
+}
+
+type MultipartUploadCleaner interface {
+	Cleanup() error
 }

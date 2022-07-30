@@ -884,16 +884,27 @@ func (g *GoFakeS3) completeMultipartUpload(bucket, object string, uploadID Uploa
 		return err
 	}
 
-	result, err := g.storage.PutObject(bucket, object, cmpu.meta, cmpu.fileBody, cmpu.size)
+	result, err := g.storage.PutObject(bucket, object, cmpu.Meta, cmpu.FileBody, cmpu.Size)
 	if err != nil {
 		return err
 	}
+	err = cmpu.FileBody.Close()
+	if err != nil {
+		return err
+	}
+	if cmpu.Cleaner != nil {
+		err = cmpu.Cleaner.Cleanup()
+		if err != nil {
+			return err
+		}
+	}
+
 	if result.VersionID != "" {
 		w.Header().Set("x-amz-version-id", string(result.VersionID))
 	}
 
 	return g.xmlEncoder(w).Encode(&CompleteMultipartUploadResult{
-		ETag:   cmpu.etag,
+		ETag:   cmpu.Etag,
 		Bucket: bucket,
 		Key:    object,
 	})

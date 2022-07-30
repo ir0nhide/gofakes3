@@ -56,7 +56,7 @@ type CompleteMultipartUploadRequest struct {
 	Parts []CompletedPart `xml:"Part"`
 }
 
-func (c CompleteMultipartUploadRequest) partsAreSorted() bool {
+func (c CompleteMultipartUploadRequest) PartsAreSorted() bool {
 	return sort.IntsAreSorted(c.partIDs())
 }
 
