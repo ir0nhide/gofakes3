@@ -703,9 +703,9 @@ func (g *GoFakeS3) copyObject(bucket, object string, meta map[string]string, w h
 	modified := g.timeSource.Now()
 	mtime, ok := srcObj.Metadata["Last-Modified"]
 	if ok {
-		modified, err = time.Parse("Mon, 2 Jan 2006 15:04:05.999999999 GMT", mtime)
-		if err != nil {
-			return err
+		parsed_mtime, err := time.Parse("Mon, 2 Jan 2006 15:04:05.999999999 GMT", mtime)
+		if err == nil {
+			modified = parsed_mtime
 		}
 	}
 
