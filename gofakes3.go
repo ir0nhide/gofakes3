@@ -700,9 +700,18 @@ func (g *GoFakeS3) copyObject(bucket, object string, meta map[string]string, w h
 		w.Header().Set("x-amz-version-id", string(result.VersionID))
 	}
 
+	modified := g.timeSource.Now()
+	mtime, ok := srcObj.Metadata["Last-Modified"]
+	if ok {
+		modified, err = time.Parse("Mon, 2 Jan 2006 15:04:05.999999999 GMT", mtime)
+		if err != nil {
+			return err
+		}
+	}
+
 	return g.xmlEncoder(w).Encode(CopyObjectResult{
 		ETag:         `"` + hex.EncodeToString(srcObj.Hash) + `"`,
-		LastModified: NewContentTime(g.timeSource.Now()),
+		LastModified: NewContentTime(modified),
 	})
 }
 
